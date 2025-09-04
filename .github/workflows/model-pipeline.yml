@@ -1,0 +1,364 @@
+name: La Liga Model Pipeline
+
+on:
+  schedule:
+    # Run weekly on Sundays at 2 AM UTC
+    - cron: '0 2 * * 0'
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'data/**'
+      - 'backend/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'data/**'
+      - 'backend/**'
+  workflow_dispatch:
+    inputs:
+      force_retrain:
+        description: 'Force model retraining'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  PYTHON_VERSION: '3.12'
+  NODE_VERSION: '18'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          
+      - name: Cache pip dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+            
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .
+          
+      - name: Run tests
+        run: |
+          pytest tests/ -v --cov=src --cov-report=xml
+          
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: true
+
+  data-validation:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .
+          
+      - name: Validate data schema
+        run: |
+          python -c "from src.laliga_pipeline.loaders import load_all; from pathlib import Path; data = load_all(Path('data')); print(f'Loaded {len(data)} matches successfully')"
+          
+      - name: Check data quality
+        run: |
+          python -c "from src.laliga_pipeline.data_schema import validate_matches; from src.laliga_pipeline.loaders import load_all; from pathlib import Path; data = load_all(Path('data')); validate_matches(data); print('Data validation passed')"
+
+  model-training:
+    runs-on: ubuntu-latest
+    needs: [test, data-validation]
+    if: github.event_name == 'schedule' || github.event.inputs.force_retrain == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    outputs:
+      model-version: ${{ steps.train.outputs.model-version }}
+      model-metrics: ${{ steps.train.outputs.model-metrics }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .
+          
+      - name: Train and evaluate model
+        id: train
+        run: |
+          python -c "
+          import json
+          from datetime import datetime
+          from pathlib import Path
+          from src.laliga_pipeline.backtest import enhanced_rolling_origin
+          from src.laliga_pipeline.loaders import load_all
+          
+          # Load data and run backtest
+          matches = load_all(Path('data'))
+          print(f'Loaded {len(matches)} matches')
+          
+          # Use smaller subset for CI/CD to avoid timeout
+          test_matches = matches.tail(1000)
+          results = enhanced_rolling_origin(test_matches, min_train=100, step_size=50, use_enhanced=True)
+          
+          # Extract metrics
+          metrics = results.get('overall_metrics', {})
+          accuracy = metrics.get('accuracy', 0)
+          brier_score = metrics.get('brier_score', 1)
+          log_loss = metrics.get('log_loss', 1)
+          
+          # Create model version
+          model_version = f\"v{datetime.now().strftime('%Y%m%d_%H%M%S')}\"
+          
+          # Save metrics
+          model_metrics = {
+              'version': model_version,
+              'accuracy': accuracy,
+              'brier_score': brier_score,
+              'log_loss': log_loss,
+              'n_predictions': results.get('n_predictions', 0),
+              'timestamp': datetime.now().isoformat()
+          }
+          
+          print(f'Model {model_version} - Accuracy: {accuracy:.3f}, Brier: {brier_score:.3f}')
+          
+          # Output for GitHub Actions
+          with open('model_metrics.json', 'w') as f:
+              json.dump(model_metrics, f, indent=2)
+          
+          print(f'::set-output name=model-version::{model_version}')
+          print(f'::set-output name=model-metrics::{json.dumps(model_metrics)}')
+          "
+          
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: model-${{ steps.train.outputs.model-version }}
+          path: |
+            model_metrics.json
+            artifacts/
+          retention-days: 30
+          
+      - name: Model performance gate
+        run: |
+          python -c "
+          import json
+          with open('model_metrics.json', 'r') as f:
+              metrics = json.load(f)
+          
+          accuracy = metrics['accuracy']
+          brier_score = metrics['brier_score']
+          
+          # Performance thresholds
+          min_accuracy = 0.45
+          max_brier = 0.65
+          
+          if accuracy < min_accuracy:
+              raise ValueError(f'Model accuracy {accuracy:.3f} below threshold {min_accuracy}')
+          
+          if brier_score > max_brier:
+              raise ValueError(f'Model Brier score {brier_score:.3f} above threshold {max_brier}')
+          
+          print(f'Model performance acceptable: Accuracy={accuracy:.3f}, Brier={brier_score:.3f}')
+          "
+
+  build-backend:
+    runs-on: ubuntu-latest
+    needs: model-training
+    if: needs.model-training.result == 'success'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ needs.model-training.outputs.model-version }}
+            
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+          
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm ci
+        
+      - name: Build frontend
+        working-directory: ./frontend
+        run: npm run build
+        
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-frontend
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+            
+      - name: Create Dockerfile for frontend
+        working-directory: ./frontend
+        run: |
+          cat > Dockerfile << 'EOF'
+          FROM node:18-alpine AS base
+          
+          FROM base AS deps
+          RUN apk add --no-cache libc6-compat
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm ci --only=production
+          
+          FROM base AS builder
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm ci
+          COPY . .
+          RUN npm run build
+          
+          FROM base AS runner
+          WORKDIR /app
+          ENV NODE_ENV production
+          RUN addgroup --system --gid 1001 nodejs
+          RUN adduser --system --uid 1001 nextjs
+          
+          COPY --from=builder /app/public ./public
+          COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+          COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+          
+          USER nextjs
+          EXPOSE 3000
+          ENV PORT 3000
+          
+          CMD ["node", "server.js"]
+          EOF
+          
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [model-training, build-backend, build-frontend]
+    if: github.ref == 'refs/heads/main' && needs.model-training.result == 'success'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Deploy to production
+        run: |
+          echo "Deploying model version: ${{ needs.model-training.outputs.model-version }}"
+          echo "Model metrics: ${{ needs.model-training.outputs.model-metrics }}"
+          # Add actual deployment commands here (e.g., kubectl, helm, etc.)
+          
+      - name: Create GitHub Release
+        if: needs.model-training.result == 'success'
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.model-training.outputs.model-version }}
+          release_name: Model Release ${{ needs.model-training.outputs.model-version }}
+          body: |
+            ## Model Performance Metrics
+            
+            ${{ needs.model-training.outputs.model-metrics }}
+            
+            ## Changes
+            - Automated model retraining and deployment
+            - Performance validation passed
+          draft: false
+          prerelease: false
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always()
+    steps:
+      - name: Notify deployment status
+        run: |
+          if [ "${{ needs.deploy.result }}" == "success" ]; then
+            echo "✅ Deployment successful"
+          else
+            echo "❌ Deployment failed"
+          fi
+          # Add notification logic (Slack, email, etc.)

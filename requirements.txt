@@ -1,0 +1,10 @@
+
+
+scipy==1.13.1
+
+pytest==8.2.0
+python-dateutil==2.9.0
+numpy==1.26.4
+pandas==2.2.2
+pandera==0.18.3
+#Pandera is used to validate DataFrame shape, column types, and value ranges at boundaries, which is an industry‑standard practice for pipeline reliability

@@ -1,0 +1,142 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: laliga_postgres
+    environment:
+      POSTGRES_DB: laliga_predictions
+      POSTGRES_USER: laliga_user
+      POSTGRES_PASSWORD: laliga_password
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - laliga_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U laliga_user -d laliga_predictions"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: laliga_redis
+    command: redis-server --appendonly yes --requirepass redis_password
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - laliga_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis_password", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: laliga_backend
+    environment:
+      # Database configuration
+      DATABASE_URL: postgresql://laliga_user:laliga_password@postgres:5432/laliga_predictions
+      
+      # Redis configuration
+      REDIS_URL: redis://:redis_password@redis:6379/0
+      
+      # Application configuration
+      DEBUG: "false"
+      SECRET_KEY: "your-super-secret-key-change-in-production"
+      ALLOWED_HOSTS: "localhost,127.0.0.1,0.0.0.0"
+      
+      # API configuration
+      API_V1_STR: "/api/v1"
+      PROJECT_NAME: "La Liga Predictions API"
+      
+      # Model configuration
+      MODEL_RETRAIN_INTERVAL_HOURS: "24"
+      CACHE_TTL_SECONDS: "3600"
+      
+      # Logging
+      LOG_LEVEL: "INFO"
+    ports:
+      - "8000:8000"
+    networks:
+      - laliga_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    volumes:
+      - ./backend/logs:/app/logs
+      - ./data:/app/data:ro  # Mount data directory as read-only
+
+  # Frontend Next.js app
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: laliga_frontend
+    environment:
+      NEXT_PUBLIC_API_URL: http://backend:8000/api
+      NODE_ENV: production
+    ports:
+      - "3000:3000"
+    networks:
+      - laliga_network
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  # Nginx reverse proxy (optional)
+  # nginx:
+  #   image: nginx:alpine
+  #   container_name: laliga_nginx
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+  #     - ./nginx/ssl:/etc/nginx/ssl:ro
+  #   networks:
+  #     - laliga_network
+  #   depends_on:
+  #     - backend
+  #     - frontend
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  laliga_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
