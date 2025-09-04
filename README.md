@@ -90,7 +90,7 @@ A production-ready platform that combines:
 - **[ML Pipeline Documentation](docs/ML_PIPELINE.md)** - Comprehensive guide to the Dixon-Coles model and feature engineering
 - **[API Documentation](docs/API_DOCUMENTATION.md)** - Complete API reference with examples
 - **[Kubernetes Deployment](k8s/README.md)** - Container orchestration and deployment guide
-
+git
 ## 🚀 How to Run This Project
 
 ### Prerequisites
@@ -107,7 +107,7 @@ Follow these steps to get the project running locally:
 
 #### 1. Clone the Repository
 ```bash
-git clone https://github.com/YOUR_USERNAME/laliga_pipeline.git
+git clone https://github.com/Suzaalx/Laliga-Prediction.git
 cd laliga_pipeline
 ```
 
@@ -156,7 +156,7 @@ If you prefer using Docker:
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/laliga_pipeline.git
+git clone https://github.com/Suzaalx/Laliga-Prediction.git
 cd laliga_pipeline
 
 # Build and start all services
